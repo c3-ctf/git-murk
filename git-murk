@@ -1,0 +1,157 @@
+#!/bin/bash
+
+function check_traversal() {
+  grep -Pq '(^|\/)\.\.(\/|$)' && fail "Found directory traversal attack!"
+}
+
+function fetch_nodie() {
+  echo "$1" | check_traversal
+  export DEST=".git/$1"
+  if [[ -f "$DEST" ]]
+  then
+    [[ "$VERBOSE" -ge 2 ]] && echo "Found duplicate object $1"
+    return 1
+  fi
+  [[ "$VERBOSE" -ge 2 ]] && echo "Downloading $1"
+  mkdir -p $(dirname "$DEST") || fail "Directory creation failed"
+  curl -C - -s "$BASE/$1" -o "$DEST" || return 2
+}
+
+function fetch() {
+  fetch_nodie "$1"
+  RET=$?
+  [[ $RET -eq 2 ]] && fail "Fetch failed"
+  return $RET
+}
+
+function fetch_obj() {
+  git cat-file -e "$1" || fetch "objects/${1:0:2}/${1:2}"
+}
+
+function get_commit_info() {
+  unset TREE
+  unset PARENT
+  while read line
+  do
+    [[ -z "$line" ]] && return
+    case "$(echo $line | awk '{print $1}')" in
+      "tree") TREE="$(echo $line | awk '{print $2}')" ;;
+      "parent") PARENT="$(echo $line | awk '{print $2}')" ;;
+      *) ;;
+    esac
+  done
+}
+
+function fetch_tree() {
+  fetch_obj "$1"
+  if [[ $? -eq 1 ]]
+  then
+    [[ "$VERBOSE" -ge 2 ]] && echo "Skipping duplicate tree $1"
+    return 1
+  fi
+  while read line
+  do
+    TYPE="$(echo $line | awk '{print $2}')"
+    OBJ="$(echo $line | awk '{print $3}')"
+    case "$TYPE" in
+      "tree") fetch_tree "$OBJ"& ;;
+      "commit") ;; #handle_commit "$OBJ"& ;;
+      "blob") fetch_obj "$OBJ"& ;;
+    esac
+  done < <(git cat-file -p "$1")
+  wait
+}
+
+function handle_commit() {
+  [[ "$VERBOSE" -ge 1 ]] && echo "Handling commit $1"
+  fetch_obj "$1"
+  get_commit_info < <(git cat-file -p "$1")
+  fetch_tree "$TREE"
+  [[ -z "$PARENT" ]] || handle_commit "$PARENT"
+}
+
+function handle_ref() {
+  read LINE
+  TARGET="$(echo $LINE | grep -oP '(?<=ref: ).*')"
+  if [[ $? -ne 0 ]]
+  then
+    TARGET="$LINE"
+  fi
+  echo $TARGET
+}
+
+function handle_packedrefs() {
+  fetch_nodie "packed-refs"
+  [[ $? -eq 2 ]] && (echo "packed-refs not found"; return 1)
+  while read line
+  do
+    [[ "${line::1}" == "#" ]] && continue
+    [[ "${line::1}" == "^" ]] && continue # TODO: actually parse annotations
+    OBJ="$(echo $line | awk '{print $1}')"
+    fetch_obj "$OBJ"
+    TARGET=".git/$(echo $line | awk '{print $2}' | sed 's@remotes/@@g')"
+    echo "$TARGET" | check_traversal
+    TARGET_PARENT="dirname .git/$TARGET"
+    echo "$TARGET_PARENT" | check_traversal
+    mkdir -p "$TARGET_PARENT"
+    echo "$OBJ" > "$TARGET"
+    echo "Handling packedref $TARGET"
+    handle_commit "$OBJ"
+  done < ".git/packed-refs"
+}
+
+function handle_packs() {
+  fetch_nodie "objects/info/packs"
+  [[ $? -eq 2 ]] && (echo "packs not found"; return 1)
+  while read line
+  do
+    TYPE=$(echo "$line" | awk '{print $1}')
+    [[ "$TYPE" != "P" ]] && continue
+    PACK=$(echo "$line" | awk '{print $2}')
+    fetch "objects/pack/$PACK"
+    fetch "objects/pack/${PACK::-4}idx"
+  done < ".git/objects/info/packs"
+}
+
+###############################################################################
+##                          MAIN CODE STARTS HERE                            ##
+###############################################################################
+
+if [[ "$#" -eq 2 ]]; then VERBOSE="$2"
+elif [[ "$#" -ne 1 ]]; then
+  echo "$0 [URL] (verbosity)"
+fi
+
+function fail() {
+  echo "$1"
+  exit 1
+}
+
+[ -d .git ] || git init
+
+export BASE=$1
+echo Fetching HEAD "$BASE/HEAD"
+if ! curl "$BASE/HEAD" -o .git/HEAD -s
+then
+	echo "BASE wasn't a git repository, adding '.git'"
+        export BASE="$BASE/.git"
+	curl "$BASE/HEAD" -o .git/HEAD -s  || fail "Not a git repo (couldn't fetch HEAD)"
+fi
+
+echo "Fetching index"
+fetch_nodie "index"
+[[ $? -ne 2 ]] && echo -e "Index fetching successful!\nIf the rest of this fails, you can at least run 'git ls-files --stage'"
+
+echo "Fetching packs"
+handle_packs
+handle_packedrefs
+
+echo "Loading HEAD and its history"
+fetch "$(handle_ref < .git/HEAD)"
+handle_commit "$(git rev-parse HEAD)"
+git checkout HEAD
+
+echo "Fetching useful bits"
+fetch "config"
+fetch_nodie "logs/HEAD"
+fetch_nodie "FETCH_HEAD"
